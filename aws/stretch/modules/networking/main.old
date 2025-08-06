@@ -1,0 +1,144 @@
+resource "aws_vpc" "default" {
+  cidr_block = var.cidr_block
+  enable_dns_support = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name = "VPC-${var.region}"
+  }
+}
+
+resource "aws_subnet" "default" {
+  count             = length(var.availability_zones)
+  vpc_id            = aws_vpc.default.id
+  cidr_block        = var.subnet_cidr_blocks[count.index]
+  availability_zone = var.availability_zones[count.index]["az"]
+
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name = "Subnet-${var.region}-${var.availability_zones[count.index]["az"]}"
+  }
+}
+
+resource "aws_internet_gateway" "default" {
+  vpc_id = aws_vpc.default.id
+
+  tags = {
+    Name = "InternetGateway-${var.region}"
+  }
+}
+
+# Create VPC Peering connections dynamically between regions
+resource "aws_vpc_peering_connection" "vpc_peering" {
+  for_each = toset(flatten([for region_1, region_2 in var.redpanda_regions_and_azs :
+    if region_1 != region_2 :
+      [
+        {
+          provider      = aws[region_1]
+          vpc_id        = module.networking_redpanda[region_1].vpc_id
+          peer_vpc_id   = module.networking_redpanda[region_2].vpc_id
+          peer_region   = region_2
+          auto_accept   = false
+          name          = "${region_1}-to-${region_2}"
+        }
+      ]
+  ]))
+
+  provider             = aws[each.value.provider]
+  vpc_id               = each.value.vpc_id
+  peer_vpc_id          = each.value.peer_vpc_id
+  peer_region          = each.value.peer_region
+  auto_accept          = each.value.auto_accept
+  tags = {
+    Name = each.value.name
+  }
+}
+
+# Create routes dynamically for each peering connection to update routing tables
+resource "aws_route" "route" {
+  for_each = aws_vpc_peering_connection.vpc_peering
+
+  route_table_id            = module.networking_redpanda[each.key].route_table_id
+  destination_cidr_block    = module.networking_redpanda[each.value.peer_region].cidr_block
+  vpc_peering_connection_id = each.value.id
+}
+
+
+resource "aws_security_group" "redpanda_sg" {
+  name        = "redpanda-sg"
+  description = "Security group for Redpanda brokers, OMB workers, and Prometheus"
+
+  # Allow all TCP from local IP for SSH access
+  ingress {
+    from_port   = 0
+    to_port     = 65535
+    protocol    = "tcp"
+    cidr_blocks = [var.local_ip]  # Dynamically pulled from tfvars (your local IP)
+    description = "Allow all TCP from local IP"
+  }
+
+  # Allow specific TCP ports for Redpanda, OMB workers, and Prometheus
+  ingress {
+    from_port   = 3000
+    to_port     = 33145
+    protocol    = "tcp"
+    cidr_blocks = flatten([
+      for region, azs in var.redpanda_regions_and_azs : [
+        for az in azs : az.cidr
+      ]
+    ])  # Dynamically pulls the CIDR blocks from redpanda_regions_and_azs
+    description = "Allow specific Redpanda, OMB, and Prometheus ports"
+  }
+
+  # Adding specific ports individually for clarity
+  ingress {
+    from_port   = 9090
+    to_port     = 9090
+    protocol    = "tcp"
+    cidr_blocks = flatten([
+      for region, azs in var.redpanda_regions_and_azs : [
+        for az in azs : az.cidr
+      ]
+    ])  # Dynamically pulls the CIDR blocks from redpanda_regions_and_azs
+    description = "Allow Prometheus port 9090"
+  }
+
+  # Additional ingress rules for ports 8080, 8081, etc. (same as above)
+  ingress {
+    from_port   = 8080
+    to_port     = 8080
+    protocol    = "tcp"
+    cidr_blocks = flatten([
+      for region, azs in var.redpanda_regions_and_azs : [
+        for az in azs : az.cidr
+      ]
+    ])
+    description = "Allow port 8080 for internal communication"
+  }
+
+  ingress {
+    from_port   = 9092
+    to_port     = 9092
+    protocol    = "tcp"
+    cidr_blocks = flatten([
+      for region, azs in var.redpanda_regions_and_azs : [
+        for az in azs : az.cidr
+      ]
+    ])
+    description = "Allow Kafka port 9092 for internal communication"
+  }
+
+  # Allow outbound traffic (e.g., for updates, external communication)
+  egress {
+    from_port   = 0
+    to_port     = 65535
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]  # Allow all outbound traffic
+    description = "Allow all outbound traffic"
+  }
+
+  tags = {
+    Name = "Redpanda Security Group"
+  }
+}
